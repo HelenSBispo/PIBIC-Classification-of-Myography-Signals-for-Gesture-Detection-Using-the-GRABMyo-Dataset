@@ -30,5 +30,5 @@ Este repositório está **sujeito a atualizações contínuas**, conforme o anda
 
 ## Estudantes
 
-Helen da Silva Bispo;
-David Santos Silvino.
+Helen da Silva Bispo (DCOMP);
+David Santos Silvino (DSI).
