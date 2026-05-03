@@ -27,3 +27,8 @@ Projeto desenvolvido na **Universidade Federal de Sergipe (UFS)** no âmbito do 
 ## Observação
 
 Este repositório está **sujeito a atualizações contínuas**, conforme o andamento e evolução da pesquisa.
+
+## Estudantes
+
+Helen da Silva Bispo;
+David Santos Silvino.
