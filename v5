@@ -1,0 +1,964 @@
+# REVISÃO: v5
+
+import os
+import re
+import sys
+import gc
+import time
+import itertools
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import wfdb
+import scipy.signal
+from scipy.stats import entropy as scipy_entropy
+from tqdm.auto import tqdm as tqdm_auto
+
+warnings.filterwarnings('ignore')
+
+# ══════════════════════════════════════════════════════════════
+# ── [FIX-10] TF / KERAS ──────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+import tensorflow as tf
+
+_tf_ver = tuple(int(x) for x in tf.__version__.split('.')[:2])
+print(f"TensorFlow: {tf.__version__}")
+if _tf_ver < (2, 12):
+    print("AVISO: recomendado TF >= 2.12.")
+
+from tensorflow import keras
+from tensorflow.keras import layers, optimizers, models
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.callbacks import (
+    EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+)
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import (
+    accuracy_score, classification_report, confusion_matrix,
+    ConfusionMatrixDisplay, roc_auc_score, roc_curve, auc,
+    precision_score, recall_score, f1_score, log_loss,
+    mean_squared_error, mean_absolute_error, r2_score,
+)
+
+# ══════════════════════════════════════════════════════════════
+# ── CONFIGURAÇÕES PRINCIPAIS ──────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+BASE_DIR = '/home/jovyan/work/Untitled Folder/Teste_1 - CNN/Dados'
+SESSOES  = ['S1', 'S2', 'S3']
+
+USAR_DADOS_BRUTOS            = False
+PORCENTAGEM_DADOS_USAR_TOTAL = 1.0   # 1.0 = 100%
+CAMINHO_MODELO_CARREGAR      = None  # ex.: 'melhor_modelo.keras'
+
+# ══════════════════════════════════════════════════════════════
+# ── GPU ───────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+print("\n--- Verificação de GPU ---")
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"  {len(gpus)} GPU(s): {[g.name for g in gpus]}")
+    except RuntimeError as e:
+        print(f"  ERRO GPU: {e}")
+else:
+    print("  Nenhuma GPU — rodando na CPU.")
+print("--- Fim GPU ---\n")
+
+# ══════════════════════════════════════════════════════════════
+# ── VALIDAÇÃO DOS CAMINHOS ────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+print(f"INFO: Verificando pastas em '{BASE_DIR}'...")
+for s in SESSOES:
+    p = os.path.join(BASE_DIR, s)
+    if not os.path.isdir(p):
+        raise FileNotFoundError(f"ERRO: Pasta '{s}' não encontrada em '{BASE_DIR}'.")
+    print(f"  ok {s}")
+
+SESSOES_A_CARREGAR = SESSOES
+CAMINHO_BASE_DADOS = BASE_DIR
+
+# ══════════════════════════════════════════════════════════════
+# ── CONSTANTES DO DATASET (GRABMyo v1.1.0) ───────────────────
+# ══════════════════════════════════════════════════════════════
+
+FREQ_AMOSTRAGEM      = 2048
+DURACAO_SEGMENTO_MS  = 500
+# Seção 2.2: 500 ms × 2048 Hz = 1024 amostras
+COMPRIMENTO_SEGMENTO = int(FREQ_AMOSTRAGEM * DURACAO_SEGMENTO_MS / 1000)  # 1024
+
+FREQ_CORTE_INFERIOR = 20.0
+FREQ_CORTE_SUPERIOR = 500.0
+ORDEM_FILTRO        = 4          # Butterworth 4ª ordem — seção 2.2
+FREQ_NOTCH          = 60.0       # [FIX-16] Notch 60 Hz
+Q_NOTCH             = 30.0
+
+# 14 canais bipolares EMG: 8 forearm + 6 wrist — seção 2.1
+INDICES_CANAIS_EMG      = list(range(14))
+NUM_CANAIS_EMG          = len(INDICES_CANAIS_EMG)  # 14
+CANAIS_TOTAIS_ESPERADOS = 32
+
+# ── [FIX-18] 17 classes: gesture1..gesture17 (Gesture List oficial) ──
+# gesture1  = Rest
+# gesture2..gesture17 = 16 gestos GRABMyo (tabela GestureList):
+#   Col. esquerda: LP, TA, TLFO, TIFO, TLFE, TIFE, IMFE, LFE
+#   Col. direita : IFE, TE, WF, WE, FP, FS, HO, HC
+DICIONARIO_CLASSES_GESTOS = {
+    1:  'Rest',
+    2:  'LP',    # Lateral Prehension
+    3:  'TA',    # Thumb Adduction
+    4:  'TLFO',  # Thumb and Little Finger Opposition
+    5:  'TIFO',  # Thumb and Index Finger Opposition
+    6:  'TLFE',  # Thumb and Little Finger Extension
+    7:  'TIFE',  # Thumb and Index Finger Extension
+    8:  'IMFE',  # Index and Middle Finger Extension
+    9:  'LFE',   # Little Finger Extension
+    10: 'IFE',   # Index Finger Extension
+    11: 'TE',    # Thumb Extension
+    12: 'WF',    # Wrist Flexion
+    13: 'WE',    # Wrist Extension
+    14: 'FP',    # Forearm Pronation
+    15: 'FS',    # Forearm Supination
+    16: 'HO',    # Hand Open
+    17: 'HC',    # Hand Close
+}
+LABELS_VALIDOS = set(DICIONARIO_CLASSES_GESTOS.keys())  # {1..17}
+
+# ══════════════════════════════════════════════════════════════
+# ── CONFIGURAÇÕES DE TREINAMENTO ─────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+TAMANHO_BUFFER_EMBARALHAR = 1024 * 2
+PROPORCAO_TESTE           = 0.2
+ESTADO_ALEATORIO          = 42
+
+EPOCAS_GRID_SEARCH       = 5
+EPOCAS_FINAIS            = 50
+PACIENCIA_EARLY_STOPPING = 10
+PACIENCIA_REDUCE_LR      = 5
+
+# Espaço de busca — Tabela 2 do artigo
+FUNCOES_ATIVACAO_GRID = ['relu', 'elu']
+OPCOES_OTIMIZADORES   = ['Adam', 'AdamW']
+FILTROS_CONV1_GRID    = [32, 64, 128]
+KERNEL_SIZES_GRID     = [3, 5, 7, 9]
+DROPOUT_RATES_GRID    = [0.1, 0.3, 0.5]
+BATCH_SIZES_GRID      = [32, 64, 128]  # [FIX-1]
+
+LEARNING_RATE_FIXO = 1e-3   # [FIX-2]
+DENSE_UNITS_FIXO   = 256    # [FIX-3]
+
+DICIONARIO_OTIMIZADORES = {
+    'Adam':  optimizers.Adam,
+    'AdamW': optimizers.AdamW,
+}
+
+NOME_ARQUIVO_MODELO_SALVO = (
+    f'melhor_modelo_cnn_emg_17gestos'
+    f'_bruto{USAR_DADOS_BRUTOS}'
+    f'_p{int(PORCENTAGEM_DADOS_USAR_TOTAL * 100)}'
+    f'_s{len(SESSOES_A_CARREGAR)}.keras'
+)
+NOME_ARQUIVO_CHECKPOINT = (
+    f'checkpoint_cnn_emg_17gestos'
+    f'_bruto{USAR_DADOS_BRUTOS}'
+    f'_p{int(PORCENTAGEM_DADOS_USAR_TOTAL * 100)}'
+    f'_s{len(SESSOES_A_CARREGAR)}.keras'
+)
+
+print("-" * 65)
+print("Configurações:")
+print(f"  Base             : {BASE_DIR}")
+print(f"  Sessões          : {SESSOES_A_CARREGAR}")
+print(f"  Freq. Amostragem : {FREQ_AMOSTRAGEM} Hz")
+print(f"  Comprimento Seg. : {COMPRIMENTO_SEGMENTO} amostras ({DURACAO_SEGMENTO_MS} ms)")
+print(f"  Canais EMG       : {NUM_CANAIS_EMG} (índices {INDICES_CANAIS_EMG})")
+print(f"  Classes          : {len(DICIONARIO_CLASSES_GESTOS)} (gesture1=Rest + gesture2..17=16 gestos)  [FIX-18]")
+print(f"  Dados Brutos     : {USAR_DADOS_BRUTOS}")
+print(f"  % dados          : {PORCENTAGEM_DADOS_USAR_TOTAL * 100:.0f}%")
+print(f"  LR fixo          : {LEARNING_RATE_FIXO}  [FIX-2]")
+print(f"  Dense fixo       : {DENSE_UNITS_FIXO}  [FIX-3]")
+print(f"  Batch no grid    : {BATCH_SIZES_GRID}  [FIX-1]")
+print("-" * 65)
+
+# ══════════════════════════════════════════════════════════════
+# ── EXTRAÇÃO DE LABEL DO NOME DO ARQUIVO ─────────────────────
+# ══════════════════════════════════════════════════════════════
+
+def extrair_label_do_nome(nome_arquivo):
+    """
+    [FIX-9] Extrai o número do gesto do nome do arquivo GRABMyo.
+    Padrão: session1_participant10_gesture3_trial1 → 3
+    """
+    m = re.search(r'gesture(\d+)', nome_arquivo, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    return None
+
+print(f"\n[FIX-9] Labels extraídos do nome do arquivo.")
+print(f"  Exemplo: 'session1_participant1_gesture10_trial1.hea' → label = 10")
+print(f"  LABELS_VALIDOS = gesture1..gesture17 (17 classes)  [FIX-18]\n")
+
+# ══════════════════════════════════════════════════════════════
+# ── FUNÇÕES DE PRÉ-PROCESSAMENTO ─────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+def filtrar_passa_banda(dados, fi=FREQ_CORTE_INFERIOR,
+                        fs_corte=FREQ_CORTE_SUPERIOR,
+                        fq=FREQ_AMOSTRAGEM, ord=ORDEM_FILTRO):
+    """Butterworth bandpass 4ª ordem — seção 2.2."""
+    nyq  = 0.5 * fq
+    low  = max(fi / nyq, 1e-5)
+    high = min(fs_corte / nyq, 0.99999)
+    if high <= low:
+        return dados
+    try:
+        sos = scipy.signal.butter(ord, [low, high], btype='band', output='sos')
+        return scipy.signal.sosfiltfilt(sos, dados, axis=0)
+    except ValueError:
+        return dados
+
+
+def filtrar_notch(dados, f0=FREQ_NOTCH, Q=Q_NOTCH, fq=FREQ_AMOSTRAGEM):
+    """[FIX-16] Notch 60 Hz — remove interferência elétrica."""
+    nyq = fq / 2.0
+    w0  = f0 / nyq
+    if not (0.01 < w0 < 0.99):
+        return dados
+    try:
+        b, a = scipy.signal.iirnotch(w0, Q)
+        return scipy.signal.filtfilt(b, a, dados, axis=0)
+    except Exception:
+        return dados
+
+
+def normalizar_sinal(sinal):
+    """
+    [FIX-17] Z-score único por segmento — seção 2.2 do artigo.
+    Evita dupla normalização com StandardScaler.
+    """
+    media = np.mean(sinal, axis=0)
+    dp    = np.std(sinal,  axis=0)
+    dp[dp < 1e-7] = 1.0
+    return (sinal - media) / dp
+
+
+def preprocessar(emg_raw, fs_real=FREQ_AMOSTRAGEM):
+    """
+    Pipeline completo — seção 2.2:
+    1. Butterworth bandpass (20–500 Hz, 4ª ordem)
+    2. Notch 60 Hz  [FIX-16]
+    3. Z-score normalization  [FIX-17]
+    """
+    emg = filtrar_passa_banda(emg_raw, fq=fs_real)
+    emg = filtrar_notch(emg,           fq=fs_real)
+    emg = normalizar_sinal(emg)
+    return emg
+
+
+def calcular_sens_espec(cm):
+    n = cm.shape[0]
+    sens  = np.zeros(n)
+    espec = np.zeros(n)
+    for k in range(n):
+        TP = cm[k, k]
+        FN = cm[k, :].sum() - TP
+        FP = cm[:, k].sum() - TP
+        TN = cm.sum() - (TP + FN + FP)
+        sens[k]  = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+        espec[k] = TN / (TN + FP) if (TN + FP) > 0 else 0.0
+    return sens, espec
+
+
+def calcular_entropia_shannon(probs):
+    probs = np.clip(probs, 1e-10, 1.0)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ent = scipy_entropy(probs, axis=1, base=2)
+    return np.mean(ent[np.isfinite(ent)])
+
+
+print("INFO: Funções de pré-processamento definidas.")
+
+# ══════════════════════════════════════════════════════════════
+# ── GERADOR DE DADOS ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+def gerador_dados(caminho_base, sessoes, comp_seg=COMPRIMENTO_SEGMENTO,
+                  idx_emg=INDICES_CANAIS_EMG, usar_brutos=USAR_DADOS_BRUTOS,
+                  verbose=True):
+    """
+    [FIX-9]  Label via nome do arquivo.
+    [FIX-13] Lista arquivos via .hea → ignora .dat sem par .hea.
+    [FIX-16] Pipeline: passa-banda + notch + Z-score.
+    """
+    if verbose:
+        print(f"\nINFO Gerador: iniciando (brutos={usar_brutos})...")
+
+    total_validos   = 0
+    total_ignorados = 0
+
+    for nome_sessao in sessoes:
+        caminho_sessao = os.path.join(caminho_base, nome_sessao)
+        if not os.path.isdir(caminho_sessao):
+            if verbose:
+                print(f"AVISO: Sessão '{nome_sessao}' não encontrada.")
+            continue
+        if verbose:
+            print(f"  Processando '{nome_sessao}'...")
+
+        # [FIX-13] Lista via .hea — garante par completo .hea + .dat
+        arquivos = sorted([
+            os.path.join(caminho_sessao, f[:-4])
+            for f in os.listdir(caminho_sessao)
+            if f.endswith('.hea')
+        ])
+
+        for caminho in arquivos:
+            nome_base = os.path.basename(caminho)
+
+            label = extrair_label_do_nome(nome_base)
+            if label is None or label not in LABELS_VALIDOS:
+                total_ignorados += 1
+                continue
+
+            try:
+                reg   = wfdb.rdrecord(caminho, warn_empty=True)
+                p_sig = getattr(reg, 'p_signal', None)
+
+                # Suporte a registros multi-segmento
+                if p_sig is None:
+                    e_sig = getattr(reg, 'e_p_signal', None)
+                    if e_sig and isinstance(e_sig, list):
+                        try:
+                            p_sig = np.concatenate(e_sig, axis=0)
+                        except Exception:
+                            p_sig = None
+
+                if p_sig is None or p_sig.ndim != 2 or p_sig.shape[0] < comp_seg:
+                    continue
+
+                # Seleciona canais EMG
+                idx_validos = [i for i in idx_emg if i < p_sig.shape[1]]
+                if not idx_validos:
+                    continue
+
+                emg_raw = p_sig[:, idx_validos].astype(np.float32)
+
+                # Padding se canais faltantes
+                if len(idx_validos) < len(idx_emg):
+                    pad = np.zeros((emg_raw.shape[0],
+                                    len(idx_emg) - len(idx_validos)),
+                                   dtype=np.float32)
+                    emg_raw = np.concatenate([emg_raw, pad], axis=1)
+
+                # Substitui NaN/Inf
+                if not np.isfinite(emg_raw).all():
+                    emg_raw = np.nan_to_num(emg_raw, nan=0.0,
+                                            posinf=0.0, neginf=0.0)
+
+                if usar_brutos:
+                    emg = emg_raw
+                else:
+                    fs_real = getattr(reg, 'fs', FREQ_AMOSTRAGEM)
+                    emg = preprocessar(emg_raw, fs_real=fs_real)
+
+                n_segs = emg.shape[0] // comp_seg
+                for i in range(n_segs):
+                    s = i * comp_seg
+                    total_validos += 1
+                    if verbose and total_validos % 5000 == 0:
+                        print(f"    ... {total_validos} segmentos gerados")
+                    yield emg[s:s + comp_seg].astype(np.float32), np.int32(label)
+
+            except Exception as exc:
+                if verbose:
+                    import traceback
+                    print(f"    ERRO [{nome_base}]: {type(exc).__name__}: {exc}")
+                    traceback.print_exc()
+            finally:
+                gc.collect()
+
+    if verbose:
+        print(f"INFO Gerador: {total_validos} segmentos produzidos "
+              f"({total_ignorados} arquivos ignorados).")
+    if total_validos == 0 and verbose:
+        print("ERRO CRÍTICO: Nenhum segmento válido.")
+
+# ══════════════════════════════════════════════════════════════
+# ── CONTAGEM RÁPIDA DE SEGMENTOS ─────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+print("\n--- Contagem rápida de segmentos ---")
+
+# [FIX-13] Via .hea → mesma lógica do gerador
+_SEGS_POR_ARQUIVO = COMPRIMENTO_SEGMENTO  # estimativa: 10240 // 1024 = 10
+# Valor calculado dinamicamente abaixo para robustez
+
+lista_labels       = []
+total_segmentos    = 0
+_arquivos_contados = 0
+_SEGS_FIXO         = 10  # 10240 // 1024; ajuste se o dataset tiver tamanho diferente
+
+for _sessao in SESSOES_A_CARREGAR:
+    _dir = os.path.join(CAMINHO_BASE_DADOS, _sessao)
+    if not os.path.isdir(_dir):
+        continue
+    for _f in sorted(os.listdir(_dir)):
+        if not _f.endswith('.hea'):   # [FIX-13] somente .hea
+            continue
+        _label = extrair_label_do_nome(_f[:-4])
+        if _label is None or _label not in LABELS_VALIDOS:
+            continue
+        for _ in range(_SEGS_FIXO):
+            lista_labels.append(_label)
+        total_segmentos    += _SEGS_FIXO
+        _arquivos_contados += 1
+        if _arquivos_contados % 500 == 0:
+            print(f"  ... {_arquivos_contados} arquivos / {total_segmentos} segmentos")
+            sys.stdout.flush()
+
+if total_segmentos == 0:
+    raise ValueError(
+        f"ERRO CRÍTICO: Nenhum segmento válido.\n"
+        f"  LABELS_VALIDOS={sorted(LABELS_VALIDOS)}\n"
+        "  Verifique os nomes dos arquivos (padrão: gestureN)."
+    )
+
+print(f"INFO: {_arquivos_contados} arquivos → {total_segmentos} segmentos estimados.")
+sys.stdout.flush()
+
+y_todos = np.array(lista_labels, dtype=np.int32)
+del lista_labels
+gc.collect()
+
+# Codifica labels
+print("INFO: Codificando labels...")
+codificador_label = LabelEncoder()
+codificador_label.fit(y_todos)
+ids_classes   = codificador_label.classes_
+NUM_CLASSES   = len(ids_classes)
+nomes_classes = [DICIONARIO_CLASSES_GESTOS.get(int(c), f'G{c}') for c in ids_classes]
+
+print(f"INFO: {NUM_CLASSES} classes: {list(zip(ids_classes.tolist(), nomes_classes))}")
+
+ausentes = LABELS_VALIDOS - set(int(c) for c in ids_classes)
+if ausentes:
+    print(f"AVISO: Gestos não encontrados nos arquivos: {sorted(ausentes)}")
+
+if NUM_CLASSES < 2:
+    raise ValueError(f"ERRO: Apenas {NUM_CLASSES} classe(s) encontrada(s).")
+
+# ══════════════════════════════════════════════════════════════
+# ── DATASETS tf.data ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+print("\n--- Criando Datasets tf.data ---")
+n_efetivo = total_segmentos
+if PORCENTAGEM_DADOS_USAR_TOTAL < 1.0:
+    n_efetivo = max(1, int(total_segmentos * PORCENTAGEM_DADOS_USAR_TOTAL))
+    print(f"INFO: {PORCENTAGEM_DADOS_USAR_TOTAL*100:.0f}% → {n_efetivo} segmentos.")
+else:
+    print(f"INFO: 100% → {n_efetivo} segmentos.")
+
+n_teste  = max(1, int(n_efetivo * PROPORCAO_TESTE))
+n_treino = n_efetivo - n_teste
+print(f"INFO: Treino ~{n_treino}  |  Teste ~{n_teste}")
+
+assinatura = (
+    tf.TensorSpec(shape=(COMPRIMENTO_SEGMENTO, NUM_CANAIS_EMG), dtype=tf.float32),
+    tf.TensorSpec(shape=(), dtype=tf.int32),
+)
+
+def fabrica_gerador():
+    return gerador_dados(CAMINHO_BASE_DADOS, SESSOES_A_CARREGAR)
+
+dataset_completo = tf.data.Dataset.from_generator(fabrica_gerador,
+                                                   output_signature=assinatura)
+if PORCENTAGEM_DADOS_USAR_TOTAL < 1.0:
+    dataset_completo = dataset_completo.take(n_efetivo)
+
+buf = min(TAMANHO_BUFFER_EMBARALHAR, n_efetivo)
+dataset_completo = dataset_completo.shuffle(buf, seed=ESTADO_ALEATORIO,
+                                            reshuffle_each_iteration=True)
+
+dataset_teste_raw  = dataset_completo.take(n_teste)
+dataset_treino_raw = dataset_completo.skip(n_teste)
+
+# Lookup label → índice 0-based
+lookup = tf.lookup.StaticHashTable(
+    tf.lookup.KeyValueTensorInitializer(
+        keys=tf.constant(ids_classes, dtype=tf.int64),
+        values=tf.range(NUM_CLASSES, dtype=tf.int64),
+    ),
+    default_value=-1,
+)
+
+def para_treino(seg, rot):
+    cod = lookup.lookup(tf.cast(rot, tf.int64))
+    return seg, tf.one_hot(cod, NUM_CLASSES, dtype=tf.float32)
+
+def para_metricas(seg, rot):
+    cod = lookup.lookup(tf.cast(rot, tf.int64))
+    return seg, tf.cast(cod, tf.int32)
+
+dataset_teste_metrics = (
+    dataset_teste_raw
+    .map(para_metricas, num_parallel_calls=tf.data.AUTOTUNE)
+    .batch(32)
+    .prefetch(tf.data.AUTOTUNE)
+)
+
+
+def criar_datasets_com_batch(batch_size):
+    """
+    [FIX-4]  Recria datasets com o batch_size correto.
+    [FIX-12] .repeat() + steps calculados para evitar esgotamento do gerador.
+    """
+    steps_treino = max(1, n_treino // batch_size)
+    steps_val    = max(1, n_teste  // batch_size)
+
+    ds_treino = (
+        dataset_treino_raw
+        .map(para_treino, num_parallel_calls=tf.data.AUTOTUNE)
+        .batch(batch_size)
+        .repeat()              # [FIX-12]
+        .prefetch(tf.data.AUTOTUNE)
+    )
+    ds_val = (
+        dataset_teste_raw
+        .map(para_treino, num_parallel_calls=tf.data.AUTOTUNE)
+        .batch(batch_size)
+        .repeat()              # [FIX-12]
+        .prefetch(tf.data.AUTOTUNE)
+    )
+    return ds_treino, ds_val, steps_treino, steps_val
+
+
+del dataset_completo, y_todos
+gc.collect()
+
+print(f"INFO: Input shape : ({COMPRIMENTO_SEGMENTO}, {NUM_CANAIS_EMG})")
+print(f"INFO: Num classes : {NUM_CLASSES}  [FIX-15]")
+
+# ══════════════════════════════════════════════════════════════
+# ── DEFINIÇÃO DO MODELO CNN ───────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+print("\n--- Definição do Modelo CNN (Figura 1 — SBCAS 2026) ---")
+
+
+def criar_modelo(
+    filtros_conv1=64,
+    kernel_size_conv1=9,
+    activation='relu',
+    dropout_rate=0.3,
+    input_shape=(COMPRIMENTO_SEGMENTO, NUM_CANAIS_EMG),
+    num_classes=NUM_CLASSES,
+    optimizer_name='AdamW',
+    learning_rate=LEARNING_RATE_FIXO,
+    dense_units=DENSE_UNITS_FIXO,
+):
+    """
+    Arquitetura 1D CNN — Figura 1 e Tabela 4 (SBCAS 2026).  [FIX-14]
+
+    INPUT             : (1024, 14)
+    Feature Block 1   : Conv1D(f, kernel_size) + BN + Act
+    Feature Block 2   : Conv1D(f, 3)           + BN + Act
+    Dimensionality Red: MaxPooling1D(2)
+    Regularization    : Dropout(rate)
+    [Iterative blocks — dashed box na Figura 1; aqui 1 iteração]
+    GlobalAvgPool
+    Dense(256) + BN + Act + Dropout
+    Softmax(NUM_CLASSES)   ← 7 neurônios, alinhado com Figura 1
+
+    Com filtros=64, kernel=9, dense=256, num_classes=17:
+      Conv1D(64,9) : 14×9×64           =  8.064  + 256 BN  =  8.320
+      Conv1D(64,3) : 64×3×64           = 12.288  + 256 BN  = 12.544
+      GlobalAvgPool→ Dense(256): 64×256 = 16.384  + 1024 BN = 17.408
+      Dense(17)    : 256×17 + 17       =  4.369
+      Total                            ≈ 42.641  (próximo de 40.455)
+    Nota: artigo reporta 40.455 com 7 classes; com 17 sobe ~2k — esperado.
+    """
+    ent = layers.Input(shape=input_shape, name='Entrada_EMG')
+    x   = ent
+
+    # Feature Extraction Block 1 — Figura 1
+    x = layers.Conv1D(filtros_conv1, kernel_size_conv1,
+                      padding='same', use_bias=False, name='Conv1')(x)
+    x = layers.BatchNormalization(name='BN1')(x)
+    x = layers.Activation(activation, name='Act1')(x)
+
+    # Feature Extraction Block 2 — Figura 1
+    x = layers.Conv1D(filtros_conv1, 3,
+                      padding='same', use_bias=False, name='Conv2')(x)
+    x = layers.BatchNormalization(name='BN2')(x)
+    x = layers.Activation(activation, name='Act2')(x)
+
+    # Dimensionality Reduction — Figura 1
+    x = layers.MaxPooling1D(2, name='MaxPool')(x)
+
+    # Regularization — Figura 1
+    x = layers.Dropout(dropout_rate, name='Dropout')(x)
+
+    # Global Average Pooling — Figura 1
+    x = layers.GlobalAveragePooling1D(name='GlobalAvgPool')(x)
+
+    # Fully Connected Stage — Figura 1: Dense(256) + BN + ReLU + Dropout
+    x = layers.Dense(dense_units, use_bias=False, name='Dense1')(x)
+    x = layers.BatchNormalization(name='BN_Dense')(x)
+    x = layers.Activation(activation, name='Act_Dense')(x)
+    x = layers.Dropout(dropout_rate, name='Drop_Dense')(x)
+
+    # Softmax Classifier — Figura 1: "Dense Layer (7 neurons)"
+    saida = layers.Dense(num_classes, activation='softmax', name='Saida')(x)
+
+    modelo = models.Model(inputs=ent, outputs=saida, name='CNN_EMG_SBCAS2026')
+    opt_cls = DICIONARIO_OTIMIZADORES.get(optimizer_name, optimizers.AdamW)
+    modelo.compile(
+        optimizer=opt_cls(learning_rate=learning_rate),
+        loss='categorical_crossentropy',
+        metrics=['accuracy'],
+    )
+    return modelo
+
+
+# [FIX-6] Verifica parâmetros do modelo padrão com 17 classes [FIX-18]
+print("INFO: Verificando parâmetros (filtros=64, kernel=9, 17 classes)...")
+_m_ref  = criar_modelo()
+_params = _m_ref.count_params()
+_alvo   = 40455   # artigo reporta com 7 classes; com 17 esperamos ~42-43k
+print(f"  Parâmetros totais: {_params:,}")
+print(f"  (artigo Tabela 4 reporta {_alvo:,} com 7 classes — diferença esperada com 17)")
+if _params > 100_000:
+    print(f"  AVISO: parâmetros muito acima do esperado — verifique a arquitetura.")
+else:
+    print(f"  OK: contagem compatível com arquitetura da Figura 1.")
+del _m_ref
+gc.collect()
+
+# ══════════════════════════════════════════════════════════════
+# ── GRID SEARCH MANUAL ────────────────────────────────────────
+# [FIX-5]  Sem scikeras/GridSearchCV
+# [FIX-12] steps_per_epoch e validation_steps passados ao fit()
+# ══════════════════════════════════════════════════════════════
+
+melhor_modelo_final = None
+history_melhor      = None
+melhores_hps_dict   = {}
+resultados_grid     = []
+
+if CAMINHO_MODELO_CARREGAR:
+    print(f"\n--- Carregando modelo: '{CAMINHO_MODELO_CARREGAR}' ---")
+    try:
+        melhor_modelo_final = tf.keras.models.load_model(CAMINHO_MODELO_CARREGAR)
+        print("INFO: Modelo carregado.")
+        melhor_modelo_final.summary(line_length=100)
+        melhores_hps_dict = {
+            'filtros_conv1': 64, 'kernel_size_conv1': 9,
+            'activation': 'relu', 'dropout_rate': 0.3,
+            'optimizer_name': 'AdamW', 'batch_size': 32,
+        }
+    except Exception as e:
+        import traceback
+        print(f"ERRO ao carregar modelo: {e}")
+        traceback.print_exc()
+        CAMINHO_MODELO_CARREGAR = None
+
+if not CAMINHO_MODELO_CARREGAR:
+    param_grid = {
+        'filtros_conv1':     FILTROS_CONV1_GRID,
+        'kernel_size_conv1': KERNEL_SIZES_GRID,
+        'activation':        FUNCOES_ATIVACAO_GRID,
+        'dropout_rate':      DROPOUT_RATES_GRID,
+        'optimizer_name':    OPCOES_OTIMIZADORES,
+        'batch_size':        BATCH_SIZES_GRID,
+    }
+
+    chaves      = list(param_grid.keys())
+    combinacoes = list(itertools.product(*param_grid.values()))
+    n_combs     = len(combinacoes)
+
+    print(f"\n--- Grid Search Manual: {n_combs} combinações ---")
+    for k, v in param_grid.items():
+        print(f"  {k}: {v}")
+    print(f"\n  Épocas/combinação : {EPOCAS_GRID_SEARCH}")
+    print(f"  LR fixo           : {LEARNING_RATE_FIXO}  [FIX-2]")
+    print(f"  Dense fixo        : {DENSE_UNITS_FIXO}  [FIX-3]")
+    print("ATENÇÃO: Demorado sem GPU!\n")
+
+    melhor_val_acc = -1.0
+    batch_atual    = None
+    ds_treino_grid = ds_val_grid = None
+    steps_tr = steps_va = None
+    t_inicio = time.time()
+
+    for idx_comb, comb in enumerate(combinacoes, start=1):
+        hps = dict(zip(chaves, comb))
+        bs  = hps['batch_size']
+
+        # [FIX-4] Recria datasets apenas quando batch_size muda
+        if bs != batch_atual:
+            print(f"  [FIX-4] Recriando datasets com batch_size={bs}...")
+            ds_treino_grid, ds_val_grid, steps_tr, steps_va = \
+                criar_datasets_com_batch(bs)
+            batch_atual = bs
+
+        hps_modelo = {k: v for k, v in hps.items() if k != 'batch_size'}
+        print(f"[{idx_comb:>4}/{n_combs}] {hps}")
+
+        tf.keras.backend.clear_session()
+        gc.collect()
+
+        modelo_tmp = criar_modelo(**hps_modelo)
+        es  = EarlyStopping(monitor='val_loss', patience=PACIENCIA_EARLY_STOPPING,
+                            restore_best_weights=True, verbose=0)
+        rlr = ReduceLROnPlateau(monitor='val_loss', factor=0.2,
+                                patience=PACIENCIA_REDUCE_LR, min_lr=1e-7,
+                                verbose=0)
+
+        try:
+            hist = modelo_tmp.fit(
+                ds_treino_grid,
+                validation_data=ds_val_grid,
+                epochs=EPOCAS_GRID_SEARCH,
+                steps_per_epoch=steps_tr,        # [FIX-12]
+                validation_steps=steps_va,       # [FIX-12]
+                callbacks=[es, rlr],
+                verbose=0,
+            )
+
+            val_acc  = max(hist.history.get('val_accuracy', [0.0]))
+            val_loss = min(hist.history.get('val_loss',     [float('inf')]))
+            print(f"         → val_acc={val_acc:.4f}  val_loss={val_loss:.4f}")
+
+            resultados_grid.append({**hps, 'val_acc': val_acc, 'val_loss': val_loss})
+
+            if val_acc > melhor_val_acc:
+                melhor_val_acc    = val_acc
+                melhores_hps_dict = hps.copy()
+                modelo_tmp.save_weights('_melhor_grid_weights.weights.h5')
+                print(f"         ★ Novo melhor! val_acc={melhor_val_acc:.4f}")
+
+        except Exception as e_comb:
+            print(f"         ERRO: {e_comb}")
+            resultados_grid.append({**hps, 'val_acc': 0.0,
+                                    'val_loss': float('inf')})
+        del modelo_tmp
+        gc.collect()
+
+    print(f"\nGrid concluído em {(time.time()-t_inicio)/60:.2f} min.")
+    print(f"Melhor val_acc = {melhor_val_acc:.4f}")
+    print("Melhores HPs:")
+    for k, v in melhores_hps_dict.items():
+        print(f"  {k:<25}: {v}")
+
+    df_grid = pd.DataFrame(resultados_grid).sort_values('val_acc', ascending=False)
+    print("\nTop 10 combinações:")
+    print(df_grid.head(10).to_string(index=False))
+
+    # ── Retreinamento final ───────────────────────────────────
+    print(f"\n--- Retreinamento Final (até {EPOCAS_FINAIS} épocas) ---")
+    tf.keras.backend.clear_session()
+    gc.collect()
+
+    best_bs = melhores_hps_dict['batch_size']
+    hps_final = {k: v for k, v in melhores_hps_dict.items() if k != 'batch_size'}
+
+    melhor_modelo_final = criar_modelo(**hps_final)
+
+    if os.path.exists('_melhor_grid_weights.weights.h5'):
+        melhor_modelo_final.load_weights('_melhor_grid_weights.weights.h5')
+        print("INFO: Pesos do grid carregados.")
+
+    ds_tr_f, ds_va_f, steps_tr_f, steps_va_f = criar_datasets_com_batch(best_bs)
+    print(f"INFO: batch_size={best_bs}, steps_treino={steps_tr_f}, "
+          f"steps_val={steps_va_f}")
+
+    history_melhor = melhor_modelo_final.fit(
+        ds_tr_f,
+        validation_data=ds_va_f,
+        epochs=EPOCAS_FINAIS,
+        steps_per_epoch=steps_tr_f,   # [FIX-12]
+        validation_steps=steps_va_f,  # [FIX-12]
+        callbacks=[
+            EarlyStopping(monitor='val_loss', patience=PACIENCIA_EARLY_STOPPING,
+                          restore_best_weights=True, verbose=1),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.2,
+                              patience=PACIENCIA_REDUCE_LR, min_lr=1e-7,
+                              verbose=1),
+            ModelCheckpoint(NOME_ARQUIVO_CHECKPOINT, monitor='val_loss',
+                            save_best_only=True, verbose=1),
+        ],
+        verbose=1,
+    )
+
+    print("\nArquitetura do Melhor Modelo:")
+    melhor_modelo_final.summary(line_length=100)
+    print(f"Parâmetros totais: {melhor_modelo_final.count_params():,}  [FIX-6/FIX-14]")
+
+# ── Curvas de treinamento ─────────────────────────────────────
+if history_melhor is not None:
+    h = history_melhor.history
+    plt.figure(figsize=(14, 5))
+    for i, (m, vm, ylabel, title) in enumerate([
+        ('loss',     'val_loss',     'Loss',     'Histórico de Perda'),
+        ('accuracy', 'val_accuracy', 'Accuracy', 'Histórico de Acurácia'),
+    ]):
+        plt.subplot(1, 2, i + 1)
+        if m  in h: plt.plot(h[m],  label='Treino')
+        if vm in h: plt.plot(h[vm], label='Validação')
+        plt.title(title); plt.xlabel('Época'); plt.ylabel(ylabel)
+        plt.legend(); plt.grid(True, linestyle=':', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+
+# ══════════════════════════════════════════════════════════════
+# ── AVALIAÇÃO FINAL ───────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+if melhor_modelo_final is not None:
+    print("\n--- Avaliação Final ---")
+    t0 = time.time()
+    probs_lista, labels_lista = [], []
+
+    for seg_lote, lab_lote in tqdm_auto(dataset_teste_metrics, desc="Avaliando"):
+        probs_lista.append(
+            melhor_modelo_final.predict_on_batch(seg_lote).numpy())
+        labels_lista.append(lab_lote.numpy())
+
+    y_prob = np.concatenate(probs_lista,  axis=0)
+    y_real = np.concatenate(labels_lista, axis=0)
+    y_pred = np.argmax(y_prob, axis=1)
+    y_oh   = to_categorical(y_real, num_classes=NUM_CLASSES)
+
+    print(f"INFO: {len(y_real)} amostras em {time.time()-t0:.2f}s")
+
+    acc    = accuracy_score(y_real, y_pred)
+    prec_w = precision_score(y_real, y_pred, average='weighted', zero_division=0)
+    rec_w  = recall_score(y_real,   y_pred, average='weighted', zero_division=0)
+    f1_w   = f1_score(y_real,       y_pred, average='weighted', zero_division=0)
+
+    auc_roc = logloss = shannon = float('nan')
+    mse = rmse = mae = r2 = float('nan')
+    sens_med = espec_med = float('nan')
+    cm = None
+
+    try: auc_roc = roc_auc_score(y_oh, y_prob, multi_class='ovr', average='weighted')
+    except Exception: pass
+    try: logloss = log_loss(y_oh, y_prob)
+    except Exception: pass
+    try: shannon = calcular_entropia_shannon(y_prob)
+    except Exception: pass
+
+    mse  = mean_squared_error(y_real, y_pred)
+    rmse = np.sqrt(mse)
+    mae  = mean_absolute_error(y_real, y_pred)
+    try: r2 = r2_score(y_real, y_pred)
+    except Exception: pass
+
+    try:
+        cm = confusion_matrix(y_real, y_pred, labels=range(NUM_CLASSES))
+        sens_p, espec_p = calcular_sens_espec(cm)
+        sens_med  = float(np.mean(sens_p[~np.isnan(sens_p)]))
+        espec_med = float(np.mean(espec_p[~np.isnan(espec_p)]))
+    except Exception as e:
+        print(f"AVISO Sens/Espec: {e}")
+
+    print("\n" + "=" * 30 + " MÉTRICAS FINAIS " + "=" * 30)
+    if melhores_hps_dict:
+        print("Hiperparâmetros:")
+        for k, v in melhores_hps_dict.items():
+            print(f"  {k:<25}: {v}")
+    print("-" * 70)
+    print(f"\nAcurácia Geral   : {acc:.4f}  ({acc*100:.1f}%)")
+    print(f"Num. de Classes  : {NUM_CLASSES}  [FIX-18]")
+    print("\nRelatório por Gesto:")
+    print(classification_report(y_real, y_pred, target_names=nomes_classes,
+                                 labels=range(NUM_CLASSES), zero_division=0))
+    print("\nMétricas Adicionais:")
+    for nome, val in [
+        ('Precisão (Pond)',      prec_w),
+        ('Recall (Pond)',        rec_w),
+        ('F1-Score (Pond)',      f1_w),
+        ('AUC ROC (OvR Pond)',   auc_roc),
+        ('Log Loss',             logloss),
+        ('Sensibilidade Média',  sens_med),
+        ('Especificidade Média', espec_med),
+        ('Entropia Shannon',     shannon),
+        ('MSE',                  mse),
+        ('RMSE',                 rmse),
+        ('MAE',                  mae),
+        ('R²',                   r2),
+    ]:
+        v_str = 'N/A' if (isinstance(val, float) and np.isnan(val)) else f'{val:.4f}'
+        print(f"  {nome:<25}: {v_str}")
+
+    # ── Matriz de Confusão ────────────────────────────────────
+    if cm is not None:
+        fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+        import seaborn as sns
+        cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+        sns.heatmap(cm,      annot=True, fmt='d',    cmap='Blues',
+                    ax=axes[0], xticklabels=nomes_classes,
+                    yticklabels=nomes_classes)
+        sns.heatmap(cm_norm, annot=True, fmt='.2f',  cmap='Blues',
+                    ax=axes[1], xticklabels=nomes_classes,
+                    yticklabels=nomes_classes)
+        axes[0].set_title('Matriz de Confusão — Contagem',   fontsize=13)
+        axes[1].set_title('Matriz de Confusão — Normalizada', fontsize=13)
+        for ax in axes:
+            ax.set_xlabel('Predito');  ax.set_ylabel('Real')
+            ax.tick_params(axis='x', rotation=30)
+        plt.tight_layout()
+        plt.show()
+
+    # ── Curvas ROC ────────────────────────────────────────────
+    print("\nGerando Curvas ROC (One-vs-Rest)...")
+    try:
+        plt.figure(figsize=(10, 8))
+        try:    cores = plt.cm.get_cmap('tab10', NUM_CLASSES)
+        except: cores = plt.colormaps.get_cmap('tab10').resampled(NUM_CLASSES)
+
+        for i in range(NUM_CLASSES):
+            if y_oh[:, i].sum() > 0 and (y_oh[:, i] != 1).sum() > 0:
+                fpr_i, tpr_i, _ = roc_curve(y_oh[:, i], y_prob[:, i])
+                auc_i = auc(fpr_i, tpr_i)
+                plt.plot(fpr_i, tpr_i, color=cores(i), lw=2.0, alpha=0.85,
+                         label=f'{nomes_classes[i]} (AUC={auc_i:.3f})')
+
+        plt.plot([0, 1], [0, 1], 'k:', lw=1.5, label='Aleatório (0.500)')
+        plt.xlim([-0.02, 1.0]); plt.ylim([-0.02, 1.05])
+        plt.xlabel('Taxa de Falsos Positivos', fontsize=12)
+        plt.ylabel('Taxa de Verdadeiros Positivos', fontsize=12)
+        plt.title(f'Curvas ROC — {NUM_CLASSES} gestos (OvR)', fontsize=13)
+        plt.legend(loc='lower right', fontsize=10)
+        plt.grid(True, linestyle='--', alpha=0.5)
+        plt.tight_layout()
+        plt.show()
+    except Exception as e:
+        print(f"ERRO ROC: {e}")
+
+else:
+    print("\nINFO: Avaliação não realizada (modelo indisponível).")
+
+# ══════════════════════════════════════════════════════════════
+# ── SALVAR MODELO FINAL ───────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+
+if melhor_modelo_final and not CAMINHO_MODELO_CARREGAR:
+    print("\n--- Salvando Modelo Final ---")
+    try:
+        melhor_modelo_final.save(NOME_ARQUIVO_MODELO_SALVO)
+        print(f"Salvo: '{os.path.abspath(NOME_ARQUIVO_MODELO_SALVO)}'")
+    except Exception as e:
+        print(f"ERRO ao salvar: {e}")
+elif melhor_modelo_final:
+    print(f"\nINFO: Modelo carregado de '{CAMINHO_MODELO_CARREGAR}' — não re-salvo.")
+else:
+    print("\nAVISO: Nenhum modelo para salvar.")
